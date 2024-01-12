@@ -32,6 +32,7 @@ option(INSIGHTS_COVERAGE            "Enable code coverage"       Off)
 option(INSIGHTS_STATIC              "Use static linking"         Off)
 
 set(INSIGHTS_LLVM_CONFIG "llvm-config" CACHE STRING "LLVM config executable to use")
+option(INSIGHTS_LLVM_ROOT "LLVM root directory" "")
 
 set(INSIGHTS_MIN_LLVM_MAJOR_VERSION 17)
 set(INSIGHTS_MIN_LLVM_VERSION ${INSIGHTS_MIN_LLVM_MAJOR_VERSION}.0)
@@ -134,15 +135,132 @@ if (BUILD_INSIGHTS_OUTSIDE_LLVM)
         set(INSIGHTS_PACKAGE_VERSION "${INSIGHTS_VERSION_MAJOR}.${INSIGHTS_VERSION_MINOR}.${INSIGHTS_VERSION_PATCH}${INSIGHTS_VERSION_SUFFIX}")
     endif()
 
+    if (INSIGHTS_LLVM_ROOT)
+        find_package(LLVM REQUIRED CONFIG PATHS ${INSIGHTS_LLVM_ROOT} NO_DEFAULT_PATH)
+        message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+        find_package(Clang REQUIRED CONFIG PATHS ${INSIGHTS_LLVM_ROOT} NO_DEFAULT_PATH)
+        message(STATUS "Found Clang ${CLANG_PACKAGE_VERSION}")
 
-    # Find LLVM Config binary for LLVM
-    # If you're on debian, go to http://llvm.org/apt/ and install the development
-    # release of LLVM (all packages).
-    # If you're on Windows, build LLVM from scratch,
-    # see Readme_Windows.md instructions.
-    find_program(LLVM_CONFIG_PATH "${INSIGHTS_LLVM_CONFIG}")
-    if(NOT LLVM_CONFIG_PATH)
-        message(FATAL_ERROR "llvm-config not found -- ${LLVM_CONFIG_PATH}: ${INSIGHTS_LLVM_CONFIG}")
+        set(LLVM_PACKAGE_VERSION_PLAIN "${LLVM_PACKAGE_VERSION}")
+    else()
+        # Find LLVM Config binary for LLVM
+        # If you're on debian, go to http://llvm.org/apt/ and install the development
+        # release of LLVM (all packages).
+        # If you're on Windows, build LLVM from scratch,
+        # see Readme_Windows.md instructions.
+        find_program(LLVM_CONFIG_PATH "${INSIGHTS_LLVM_CONFIG}")
+        if(NOT LLVM_CONFIG_PATH)
+            message(FATAL_ERROR "llvm-config not found -- ${LLVM_CONFIG_PATH}: ${INSIGHTS_LLVM_CONFIG}")
+        endif()
+
+        
+
+        # This function saves the output of the llvm-config command with the given
+        # switch to the variable named VARNAME.
+        #
+        # Example usage: llvm_config(LLVM_CXXFLAGS "--cxxflags")
+        function(llvm_config VARNAME switch)
+            set(CONFIG_COMMAND "${LLVM_CONFIG_PATH}" "${switch}")
+
+            execute_process(
+                COMMAND ${CONFIG_COMMAND} ${LIB_TYPE}
+                RESULT_VARIABLE HAD_ERROR
+                OUTPUT_VARIABLE CONFIG_OUTPUT
+            )
+
+            if (HAD_ERROR)
+                string(REPLACE ";" " " CONFIG_COMMAND_STR "${CONFIG_COMMAND}")
+                message(STATUS "${CONFIG_COMMAND_STR}")
+                message(FATAL_ERROR "llvm-config failed with status ${HAD_ERROR}")
+            endif()
+
+            # replace linebreaks with semicolon
+            string(REGEX REPLACE
+                "[ \t]*[\r\n]+[ \t]*" ";"
+                CONFIG_OUTPUT ${CONFIG_OUTPUT})
+
+            if(INSIGHTS_USE_SYSTEM_INCLUDES)
+                # make all includes system include to prevent the compiler to warn about issues in LLVM/Clang
+                if(NOT WIN32)
+                    string(REGEX REPLACE "-I" "-isystem" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+                else()
+                    if(IS_MSVC_CL)
+                        # See https://devblogs.microsoft.com/cppblog/broken-warnings-theory/
+                        string(REGEX REPLACE "-I" "/external:I " CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+                    endif()
+                endif()
+            endif()
+
+            # remove certain options clang doesn't like
+            if(IS_CLANG)
+                string(REGEX REPLACE "-Wl,--no-keep-files-mapped" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+                string(REGEX REPLACE "-Wl,--no-map-whole-files" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+                string(REGEX REPLACE "-fuse-ld=gold" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+            elseif(IS_GNU)
+                string(REGEX REPLACE "-Wcovered-switch-default" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+                string(REGEX REPLACE "-Wstring-conversion" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+                string(REGEX REPLACE "-Werror=unguarded-availability-new" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+                string(REGEX REPLACE "-Wno-unknown-warning-option" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+                string(REGEX REPLACE "-Wno-unused-command-line-argument" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+            endif()
+
+            # Since Clang 10 of ziglang C++14 is set
+            string(REGEX REPLACE "-std[:=]+c\\+\\+[0-9][0-9]" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
+
+            # make result available outside
+            set(${VARNAME} ${CONFIG_OUTPUT} PARENT_SCOPE)
+
+            # Optionally output the configured value
+            message(STATUS "llvm_config(${VARNAME})=>${CONFIG_OUTPUT}")
+
+            # cleanup
+            unset(CONFIG_COMMAND)
+        endfunction(llvm_config)
+
+        llvm_config(LLVM_CXXFLAGS "--cxxflags")
+        llvm_config(LLVM_LDFLAGS "--ldflags")
+
+        llvm_config(LLVM_LIBS2 "--libs")
+        if(WIN32)
+            # libs list separated with " " (space).
+            # CMake does not understand list with spaces,
+            # but instead requires ; (semicolon).
+            # Use ".lib " as string to replace instead of single " " (space)
+            # since LLVM/Clang libraries can be installed into folder
+            # with spaces (e.g., C:\Program Files (x86)\LLVM\bin)
+            string(REPLACE ".lib " ".lib;" LLVM_LIBS "${LLVM_LIBS2}")
+        else()
+            set(LLVM_LIBS ${LLVM_LIBS2})
+        endif()
+
+        llvm_config(LLVM_LIBDIR "--libdir")
+        llvm_config(LLVM_INCLUDE_DIR "--includedir")
+
+        llvm_config(LLVM_SYSTEM_LIBS2 "--system-libs")
+        if(WIN32)
+            string(REPLACE ".lib " ".lib;" LLVM_SYSTEM_LIBS "${LLVM_SYSTEM_LIBS2}")
+            # For Win10 (?) some Win API things moved to Mincore.lib.
+            # (VerQueryValue, GetFileVersionInfoSize, GetFileVersionInfo)
+            # llvm-config does not contain it. Add manually.
+            set(LLVM_SYSTEM_LIBS "${LLVM_SYSTEM_LIBS};Mincore.lib")
+        elseif(APPLE)
+            string(REPLACE ".dylib" "" LLVM_SYSTEM_LIBS "${LLVM_SYSTEM_LIBS2}")
+            string(REPLACE "/usr/lib/lib" "-l" LLVM_SYSTEM_LIBS "${LLVM_SYSTEM_LIBS}")
+            set(LLVM_SYSTEM_LIBS ${LLVM_SYSTEM_LIBS})
+        else()
+            set(LLVM_SYSTEM_LIBS ${LLVM_SYSTEM_LIBS2})
+        endif()
+
+        llvm_config(LLVM_PACKAGE_VERSION "--version")
+        string(REPLACE "git" "" LLVM_PACKAGE_VERSION_PLAIN "${LLVM_PACKAGE_VERSION}")
+        string(REPLACE "rc" "" LLVM_PACKAGE_VERSION_PLAIN "${LLVM_PACKAGE_VERSION_PLAIN}")
+
+        # With Clang 16 the location (path) of the include folder changed. Previously it was 15.0.0 now it is 16.
+        if(${LLVM_PACKAGE_VERSION_PLAIN} VERSION_GREATER_EQUAL "15.0.0")
+            string(REGEX REPLACE "([0-9]+).[0-9]+.[0-9]+" "\\1" LLVM_PACKAGE_VERSION_MAJOR_PLAIN "${LLVM_PACKAGE_VERSION_PLAIN}")
+        else()
+            set(LLVM_PACKAGE_VERSION_MAJOR_PLAIN "${LLVM_PACKAGE_VERSION_PLAIN}")
+        endif()
     endif()
 
     if(INSIGHTS_STATIC)
@@ -157,113 +275,12 @@ if (BUILD_INSIGHTS_OUTSIDE_LLVM)
         else()
             set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -static")
         endif()
-    endif()
-
-    # This function saves the output of the llvm-config command with the given
-    # switch to the variable named VARNAME.
-    #
-    # Example usage: llvm_config(LLVM_CXXFLAGS "--cxxflags")
-    function(llvm_config VARNAME switch)
-        set(CONFIG_COMMAND "${LLVM_CONFIG_PATH}" "${switch}")
-
-        execute_process(
-            COMMAND ${CONFIG_COMMAND} ${LIB_TYPE}
-            RESULT_VARIABLE HAD_ERROR
-            OUTPUT_VARIABLE CONFIG_OUTPUT
-        )
-
-        if (HAD_ERROR)
-            string(REPLACE ";" " " CONFIG_COMMAND_STR "${CONFIG_COMMAND}")
-            message(STATUS "${CONFIG_COMMAND_STR}")
-            message(FATAL_ERROR "llvm-config failed with status ${HAD_ERROR}")
-        endif()
-
-        # replace linebreaks with semicolon
-        string(REGEX REPLACE
-            "[ \t]*[\r\n]+[ \t]*" ";"
-            CONFIG_OUTPUT ${CONFIG_OUTPUT})
-
-        if(INSIGHTS_USE_SYSTEM_INCLUDES)
-            # make all includes system include to prevent the compiler to warn about issues in LLVM/Clang
-            if(NOT WIN32)
-                string(REGEX REPLACE "-I" "-isystem" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-            else()
-                if(IS_MSVC_CL)
-                    # See https://devblogs.microsoft.com/cppblog/broken-warnings-theory/
-                    string(REGEX REPLACE "-I" "/external:I " CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-                endif()
-            endif()
-        endif()
-
-        # remove certain options clang doesn't like
-        if(IS_CLANG)
-            string(REGEX REPLACE "-Wl,--no-keep-files-mapped" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-            string(REGEX REPLACE "-Wl,--no-map-whole-files" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-            string(REGEX REPLACE "-fuse-ld=gold" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-        elseif(IS_GNU)
-            string(REGEX REPLACE "-Wcovered-switch-default" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-            string(REGEX REPLACE "-Wstring-conversion" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-            string(REGEX REPLACE "-Werror=unguarded-availability-new" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-            string(REGEX REPLACE "-Wno-unknown-warning-option" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-            string(REGEX REPLACE "-Wno-unused-command-line-argument" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-        endif()
-
-        # Since Clang 10 of ziglang C++14 is set
-        string(REGEX REPLACE "-std[:=]+c\\+\\+[0-9][0-9]" "" CONFIG_OUTPUT "${CONFIG_OUTPUT}")
-
-        # make result available outside
-        set(${VARNAME} ${CONFIG_OUTPUT} PARENT_SCOPE)
-
-        # Optionally output the configured value
-        message(STATUS "llvm_config(${VARNAME})=>${CONFIG_OUTPUT}")
-
-        # cleanup
-        unset(CONFIG_COMMAND)
-    endfunction(llvm_config)
-
-    llvm_config(LLVM_CXXFLAGS "--cxxflags")
-    llvm_config(LLVM_LDFLAGS "--ldflags")
-
-    llvm_config(LLVM_LIBS2 "--libs")
-    if(WIN32)
-        # libs list separated with " " (space).
-        # CMake does not understand list with spaces,
-        # but instead requires ; (semicolon).
-        # Use ".lib " as string to replace instead of single " " (space)
-        # since LLVM/Clang libraries can be installed into folder
-        # with spaces (e.g., C:\Program Files (x86)\LLVM\bin)
-        string(REPLACE ".lib " ".lib;" LLVM_LIBS "${LLVM_LIBS2}")
     else()
-        set(LLVM_LIBS ${LLVM_LIBS2})
-    endif()
-
-    llvm_config(LLVM_LIBDIR "--libdir")
-    llvm_config(LLVM_INCLUDE_DIR "--includedir")
-
-    llvm_config(LLVM_SYSTEM_LIBS2 "--system-libs")
-    if(WIN32)
-        string(REPLACE ".lib " ".lib;" LLVM_SYSTEM_LIBS "${LLVM_SYSTEM_LIBS2}")
-        # For Win10 (?) some Win API things moved to Mincore.lib.
-        # (VerQueryValue, GetFileVersionInfoSize, GetFileVersionInfo)
-        # llvm-config does not contain it. Add manually.
-        set(LLVM_SYSTEM_LIBS "${LLVM_SYSTEM_LIBS};Mincore.lib")
-    elseif(APPLE)
-        string(REPLACE ".dylib" "" LLVM_SYSTEM_LIBS "${LLVM_SYSTEM_LIBS2}")
-        string(REPLACE "/usr/lib/lib" "-l" LLVM_SYSTEM_LIBS "${LLVM_SYSTEM_LIBS}")
-        set(LLVM_SYSTEM_LIBS ${LLVM_SYSTEM_LIBS})
-    else()
-        set(LLVM_SYSTEM_LIBS ${LLVM_SYSTEM_LIBS2})
-    endif()
-
-    llvm_config(LLVM_PACKAGE_VERSION "--version")
-    string(REPLACE "git" "" LLVM_PACKAGE_VERSION_PLAIN "${LLVM_PACKAGE_VERSION}")
-    string(REPLACE "rc" "" LLVM_PACKAGE_VERSION_PLAIN "${LLVM_PACKAGE_VERSION_PLAIN}")
-
-    # With Clang 16 the location (path) of the include folder changed. Previously it was 15.0.0 now it is 16.
-    if(${LLVM_PACKAGE_VERSION_PLAIN} VERSION_GREATER_EQUAL "15.0.0")
-        string(REGEX REPLACE "([0-9]+).[0-9]+.[0-9]+" "\\1" LLVM_PACKAGE_VERSION_MAJOR_PLAIN "${LLVM_PACKAGE_VERSION_PLAIN}")
-    else()
-        set(LLVM_PACKAGE_VERSION_MAJOR_PLAIN "${LLVM_PACKAGE_VERSION_PLAIN}")
+        if(WIN32)
+            add_definitions(/MD)
+        else()
+            set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -shared")
+        endif()
     endif()
 
     # always generate the compile commands
